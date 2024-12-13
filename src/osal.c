@@ -3052,28 +3052,50 @@ bootid_parse_uuid(bin128_t *s, const void *p, const size_t n) {
   return false;
 }
 
-__cold MDBX_INTERNAL_FUNC bin128_t osal_bootid(void) {
-  bin128_t bin = {{0, 0}};
+#if defined(__linux__) || defined(__gnu_linux__)
+
+__cold static bool is_inside_lxc(void) {
+  bool inside_lxc = false;
+  FILE *mounted = setmntent("/proc/mounts", "r");
+  if (mounted) {
+    const struct mntent *ent;
+    while (nullptr != (ent = getmntent(mounted))) {
+      if (strcmp(ent->mnt_fsname, "lxcfs") == 0 && strncmp(ent->mnt_dir, "/proc/", 6) == 0) {
+        inside_lxc = true;
+        break;
+      }
+    }
+    endmntent(mounted);
+  }
+  return inside_lxc;
+}
+
+__cold static bool proc_read_uuid(const char *path, bin128_t *target) {
+  const int fd = open(path, O_RDONLY | O_NOFOLLOW);
+  if (fd != -1) {
+    struct statfs fs;
+    char buf[42];
+    const ssize_t len = (fstatfs(fd, &fs) == 0 &&
+                         (fs.f_type == /* procfs */ 0x9FA0 || (fs.f_type == /* tmpfs */ 0x1021994 && is_inside_lxc())))
+                            ? read(fd, buf, sizeof(buf))
+                            : -1;
+    const int err = close(fd);
+    assert(err == 0);
+    (void)err;
+    if (len > 0)
+      return bootid_parse_uuid(target, buf, len);
+  }
+  return false;
+}
+#endif /* Linux */
+
+__cold bin128_t osal_bootid(void) {
+  bin128_t uuid = {{0, 0}};
   bool got_machineid = false, got_boottime = false, got_bootseq = false;
 
 #if defined(__linux__) || defined(__gnu_linux__)
-  {
-    const int fd =
-        open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_NOFOLLOW);
-    if (fd != -1) {
-      struct statfs fs;
-      char buf[42];
-      const ssize_t len =
-          (fstatfs(fd, &fs) == 0 && fs.f_type == /* procfs */ 0x9FA0)
-              ? read(fd, buf, sizeof(buf))
-              : -1;
-      const int err = close(fd);
-      assert(err == 0);
-      (void)err;
-      if (len > 0 && bootid_parse_uuid(&bin, buf, len))
-        return bin;
-    }
-  }
+  if (proc_read_uuid("/proc/sys/kernel/random/boot_id", &uuid))
+    return uuid;
 #endif /* Linux */
 
 #if defined(__APPLE__) || defined(__MACH__)
@@ -3252,11 +3274,28 @@ __cold MDBX_INTERNAL_FUNC bin128_t osal_bootid(void) {
   }
 #endif /* __NetBSD__ */
 
+#if !(defined(_WIN32) || defined(_WIN64))
+  if (!got_machineid) {
+    int fd = open("/etc/machine-id", O_RDONLY);
+    if (fd == -1)
+      fd = open("/var/lib/dbus/machine-id", O_RDONLY);
+    if (fd != -1) {
+      char buf[42];
+      const ssize_t len = read(fd, buf, sizeof(buf));
+      const int err = close(fd);
+      assert(err == 0);
+      (void)err;
+      if (len > 0)
+        got_machineid = bootid_parse_uuid(&uuid, buf, len);
+    }
+  }
+#endif /* !Windows */
+
 #if _XOPEN_SOURCE_EXTENDED
   if (!got_machineid) {
-    const int hostid = gethostid();
-    if (hostid > 0) {
-      bootid_collect(&bin, &hostid, sizeof(hostid));
+    const long hostid = gethostid();
+    if (hostid != 0 && hostid != -1) {
+      bootid_collect(&uuid, &hostid, sizeof(hostid));
       got_machineid = true;
     }
   }
@@ -3264,8 +3303,8 @@ __cold MDBX_INTERNAL_FUNC bin128_t osal_bootid(void) {
 
   if (!got_machineid) {
   lack:
-    bin.x = bin.y = 0;
-    return bin;
+    uuid.x = uuid.y = 0;
+    return uuid;
   }
 
   /*--------------------------------------------------------------------------*/
@@ -3319,12 +3358,12 @@ __cold MDBX_INTERNAL_FUNC bin128_t osal_bootid(void) {
     const struct utmpx id = {.ut_type = BOOT_TIME};
     const struct utmpx *entry = getutxid(&id);
     if (entry) {
-      bootid_collect(&bin, entry, sizeof(*entry));
+      bootid_collect(&uuid, entry, sizeof(*entry));
       got_boottime = true;
       while (unlikely((entry = getutxid(&id)) != nullptr)) {
         /* have multiple reboot records, assuming we can distinguish next
          * bootsession even if RTC is wrong or absent */
-        bootid_collect(&bin, entry, sizeof(*entry));
+        bootid_collect(&uuid, entry, sizeof(*entry));
         got_bootseq = true;
       }
     }
@@ -3353,7 +3392,7 @@ __cold MDBX_INTERNAL_FUNC bin128_t osal_bootid(void) {
       goto lack;
   }
 
-  return bin;
+  return uuid;
 }
 
 __cold int mdbx_get_sysraminfo(intptr_t *page_size, intptr_t *total_pages,
